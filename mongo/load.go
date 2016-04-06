@@ -10,16 +10,17 @@ import (
 )
 
 var (
-	// artists *mgo.Collection
-	// albums  *mgo.Collection
+	artists *mgo.Collection
+	albums  *mgo.Collection
 	tracks  *mgo.Collection
+	work    chan mf.Music
+	done    chan string
 )
 
 func doMusic(path string, music mf.Music, err error) error {
 	t, _ := music.Track()
-	fmt.Printf("%s: %s / %s - %02d %s\n", music.FileType(), music.Artist(), music.Album(), t, music.Title())
-	fmt.Printf("%s\n", music.Tags()["musicbrainz_albumid"])
-	doTrack(music)
+	fmt.Printf("%s: %s / %s - %02d. %s\n", music.FileType(), music.Artist(), music.Album(), t, music.Title())
+	work <- music
 	return nil
 }
 
@@ -37,40 +38,75 @@ func doArtist(music mf.Music) error {
 
 	_, err := artists.Upsert(&key, &artist)
 
-	if err != nil {
-		panic(err)
-	}
-
+	return err
 }
 
-func doTrack(music mf.Music) error {
-	trackNum, _ := music.Track()
-	diskNum, _ := music.Disc()
+func doAlbum(music mf.Music) error {
+	_, trackTotal := music.Track()
+	_, discTotal := music.Disc()
 
-	track := bson.M{
-		"artist": music.Artist(),
-		"albumartist": music.AlbumArtist(),
-		"album": music.Album(),
-		"title": music.Title(),
-		"number": trackNum,
-		"disc": diskNum,
-		"year": music.Year(),
+	album := bson.M{
+		"title":  music.Album(),
+		"artist": music.AlbumArtist(),
+		"year":   music.Year(),
+		"tracks": trackTotal,
+		"discs":  discTotal,
 		"musicbrainz": bson.M{
-			"artist": music.Tags()["musicbrainz_artistid"],
 			"albumartist": music.Tags()["musicbrainz_albumartistid"],
-			"album": music.Tags()["musicbrainz_albumid"],
+			"release":     music.Tags()["musicbrainz_albumid"],
 		},
 	}
 
 	key := bson.M{
-		"album": music.Album(),
+		"artist": music.AlbumArtist(),
+		"title":  music.Album(),
+		"year":   music.Year(),
+	}
+
+	_, err := albums.Upsert(&key, &album)
+
+	return err
+}
+
+func doTrack(music mf.Music) error {
+	trackNum, _ := music.Track()
+	discNum, _ := music.Disc()
+
+	track := bson.M{
+		"artist":      music.Artist(),
 		"albumartist": music.AlbumArtist(),
-		"number": trackNum,
+		"album":       music.Album(),
+		"title":       music.Title(),
+		"number":      trackNum,
+		"disc":        discNum,
+		"year":        music.Year(),
+		"musicbrainz": bson.M{
+			"artist":      music.Tags()["musicbrainz_artistid"],
+			"albumartist": music.Tags()["musicbrainz_albumartistid"],
+			"release":     music.Tags()["musicbrainz_albumid"],
+		},
+	}
+
+	key := bson.M{
+		"album":       music.Album(),
+		"albumartist": music.AlbumArtist(),
+		"year":        music.Year(),
+		"number":      trackNum,
+		"disc":        discNum,
 	}
 
 	_, err := tracks.Upsert(&key, &track)
 
 	return err
+}
+
+func worker() {
+	for music := range work {
+		doArtist(music)
+		doAlbum(music)
+		doTrack(music)
+	}
+	done <- ""
 }
 
 func main() {
@@ -98,24 +134,24 @@ func main() {
 		panic(err)
 	}
 
-	// // albums
-	// albums = session.DB("music").C("albums")
-	// index = mgo.Index{
-	// 	Key:        []string{"title", "artist", "year"},
-	// 	Unique:     true,
-	// 	DropDups:   true,
-	// 	Background: true,
-	// 	Sparse:     true,
-	// }
-	// err = albums.EnsureIndex(index)
-	// if err != nil {
-	// 	panic(err)
-	// }
+	// albums
+	albums = session.DB("music").C("albums")
+	index = mgo.Index{
+		Key:        []string{"title", "artist", "year"},
+		Unique:     true,
+		DropDups:   true,
+		Background: true,
+		Sparse:     true,
+	}
+	err = albums.EnsureIndex(index)
+	if err != nil {
+		panic(err)
+	}
 
 	// tracks
 	tracks = session.DB("music").C("tracks")
-	index := mgo.Index{
-		Key:        []string{"album", "albumartist", "number"},
+	index = mgo.Index{
+		Key:        []string{"album", "albumartist", "year", "number", "disc"},
 		Unique:     true,
 		DropDups:   true,
 		Background: true,
@@ -126,7 +162,21 @@ func main() {
 		panic(err)
 	}
 
+	work = make(chan mf.Music)
+	done = make(chan string)
+
+	workers := 5
+
+	for i := 0; i < workers; i++ {
+		go worker()
+	}
+
 	if len(root) > 0 {
 		mf.ScanMusic(root, doMusic)
+		close(work)
+	}
+
+	for i := 0; i < workers; i++ {
+		<-done
 	}
 }
